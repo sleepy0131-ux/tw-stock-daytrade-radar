@@ -1,0 +1,1851 @@
+<!DOCTYPE html>
+<!--
+====================================================================
+改版文檔紀錄 (Changelog)
+====================================================================
+本次改版內容:
+- [Bug修正] 開盤時段判斷改用K棒時間字串直接切HH:MM,不再用裝置本地時區
+  (Date().getHours() 在非台北時區的裝置上會算錯開盤時間)
+- [Bug修正] 通知/音效防刷:同一檔股票同一根5分K時間戳,只會提醒一次
+- [新增] 純Web Audio合成音效(前兆單音、多頭雙音上揚、空頭雙音下沉),
+  沒有載入任何外部音檔
+- [新增] 三色燈號升級:常態隱藏 / 藍燈慢閃(前兆,pulse-slow 3秒一次)
+  / 紅燈快閃(多頭確立)/ 綠燈快閃(空頭確立),blink-fast 0.5秒一次
+- [新增] 型態觸發統計表依總次數即時排序,當日最高亮金色列
+- [新增] 今日監控紀錄 CSV/JSON 匯出
+- [新增] 多空選股表格每列加「➕」按鈕,直接丟進雷達股票池;
+  雷達輸入框支援中文股名模糊比對(比對「多空選股」上次抓到的名單)
+- [新增] 查價線鎖定時智慧吸附最近K棒的高/低/開/收價
+- [新增] 雷達每檔股票額外拼接過去5個交易日的5分K再接today,解決
+  剛開盤/未開盤時K棒不足、線圖空白的問題
+- [新增] Wake Lock:開始監控時嘗試鎖定螢幕不休眠,停止時釋放
+- [新增] PWA 骨架:manifest.json、service-worker.js、離線快取
+  ⚠️ 但 Service Worker 與「安裝到主畫面」需要頁面跑在真實 HTTPS
+  網域上,本機檔案或暫存連結無法真的安裝成獨立App,詳見回覆說明
+- [移除] 週轉紀錄分頁整個拿掉(含歷史存檔的UI跟呼叫)
+- [不適用] 「銷毀舊圖表實例」:本專案是單一Canvas手刻重繪,不是
+  Lightweight Charts那種有實例物件的圖表庫,沒有實例可銷毀,此項略過
+====================================================================
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="theme-color" content="#12151b">
+<link rel="manifest" href="manifest.json">
+<title>台股 K 線 / 支撐壓力查詢</title>
+<style>
+  :root{
+    --bg: #12151b;
+    --panel: #1a1e27;
+    --panel-2: #20242f;
+    --border: #2a3040;
+    --text: #e7e9ee;
+    --text-dim: #8992a3;
+    --text-faint: #5b6376;
+    --up: #e8543a;      /* 台股慣例: 紅漲 */
+    --down: #1fa971;    /* 台股慣例: 綠跌 */
+    --flat: #8992a3;
+    --accent: #4c8dff;  /* 交界/操作重點色 */
+    --accent-2: #f5a623; /* 壓力/支撐輔助色 */
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Noto Sans Mono TC", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Segoe UI", sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);}
+  body{
+    padding-bottom:40px;
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(76,141,255,.12), transparent 40%),
+      radial-gradient(circle at 85% 15%, rgba(245,166,35,.08), transparent 45%),
+      linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+    background-size: auto, auto, 26px 26px, 26px 26px;
+    background-attachment: fixed;
+  }
+  .wrap{max-width:640px;margin:0 auto;padding:14px 12px 0;}
+  h1{font-size:17px;font-weight:700;letter-spacing:.02em;margin:6px 0 2px;}
+  h1 .accent-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px 1px var(--accent);margin-right:6px;vertical-align:middle;}
+  .sub{font-size:12px;color:var(--text-dim);margin:0 0 14px;}
+
+  .navbar{display:flex;gap:6px;margin-bottom:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:4px;}
+  .navbar button{flex:1;background:transparent;color:var(--text-dim);font-weight:600;font-size:12px;padding:9px 4px;border-radius:8px;transition:background .15s,color .15s;}
+  .navbar button.active{background:linear-gradient(180deg, rgba(76,141,255,.22), rgba(76,141,255,.06));color:var(--text);box-shadow:inset 0 0 0 1px rgba(76,141,255,.5);}
+
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;position:relative;overflow:hidden;}
+  .panel::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg, transparent, rgba(76,141,255,.55), transparent);}
+  .panel-title{font-size:12px;color:var(--text-dim);margin:0 0 8px;display:flex;justify-content:space-between;align-items:center;text-transform:uppercase;letter-spacing:.05em;}
+
+  .row{display:flex;gap:8px;}
+  .row + .row{margin-top:8px;}
+  input[type=text], input[type=number], input[type=date], input[type=password]{
+    background:var(--panel-2);border:1px solid var(--border);color:var(--text);
+    border-radius:8px;padding:9px 10px;font-size:15px;font-family:var(--mono);
+    width:100%;min-width:0;
+  }
+  input::placeholder{color:var(--text-faint);}
+  button{
+    background:var(--accent);border:none;color:#0b0e14;font-weight:700;
+    border-radius:8px;padding:9px 14px;font-size:14px;white-space:nowrap;cursor:pointer;
+  }
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--text);font-weight:500;}
+  button.tab{background:var(--panel-2);color:var(--text-dim);border:1px solid var(--border);font-weight:600;flex:1;}
+  button.tab.active{background:var(--accent);color:#0b0e14;border-color:var(--accent);}
+  button:disabled{opacity:.5;cursor:default;}
+  details summary{cursor:pointer;color:var(--text-dim);font-size:12px;list-style:none;}
+  details summary::-webkit-details-marker{display:none;}
+  details[open] summary{color:var(--accent);}
+
+  #statusBar{font-size:12px;min-height:16px;color:var(--text-dim);margin:-2px 0 10px;}
+  #statusBar.err{color:var(--up);}
+  #statusBar.ok{color:var(--down);}
+
+  .quoteHead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+  .quoteHead .name{font-size:14px;color:var(--text-dim);}
+  .quoteHead .price{font-size:30px;font-weight:800;font-family:var(--mono);}
+  .quoteHead .chg{font-size:14px;font-weight:700;font-family:var(--mono);}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px;}
+  .cell{background:var(--panel-2);border-radius:8px;padding:6px 4px;text-align:center;}
+  .cell .lbl{font-size:10px;color:var(--text-faint);}
+  .cell .val{font-size:13px;font-family:var(--mono);font-weight:600;margin-top:2px;}
+
+  .srGrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
+  .srCell{background:var(--panel-2);border-radius:8px;padding:10px 6px;text-align:center;border-top:3px solid var(--border);}
+  .srCell.res{border-top-color:var(--up);}
+  .srCell.mid{border-top-color:var(--accent);}
+  .srCell.sup{border-top-color:var(--down);}
+  .srCell .lbl{font-size:11px;color:var(--text-dim);}
+  .srCell .val{font-size:19px;font-weight:800;font-family:var(--mono);margin-top:4px;}
+  .methodRow{display:flex;gap:8px;margin-top:10px;align-items:center;}
+  .note{font-size:11px;color:var(--text-faint);margin-top:8px;line-height:1.5;}
+
+  .tabRow{display:flex;gap:6px;margin-bottom:8px;}
+  .fiveminCtrl{display:none;gap:8px;margin-bottom:8px;}
+  .fiveminCtrl.show{display:flex;}
+  canvas{width:100%;display:block;background:var(--panel-2);border-radius:8px;touch-action:pan-y;}
+  #chartMeta{font-size:11px;color:var(--text-faint);margin-top:6px;display:flex;justify-content:space-between;}
+
+  footer{max-width:640px;margin:20px auto 0;padding:0 12px;font-size:11px;color:var(--text-faint);line-height:1.7;}
+  footer a{color:var(--accent);}
+  .kv{display:flex;justify-content:space-between;gap:8px;margin:2px 0;}
+
+  .page{display:block;}
+  .page.hidden{display:none;}
+
+  .rankTable{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;}
+  .rankTable th{text-align:left;color:var(--text-faint);font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:4px 6px;border-bottom:1px solid var(--border);}
+  .rankTable td{padding:7px 6px;border-bottom:1px solid rgba(42,48,64,.6);}
+  .rankTable tr:active{background:rgba(76,141,255,.08);}
+  .rankTable .sym{color:var(--text-dim);font-size:10px;}
+  .rankTable .name{font-family:var(--sans);}
+  .chip{display:inline-block;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;}
+  .chip.up{background:rgba(232,84,58,.15);color:var(--up);}
+  .chip.down{background:rgba(31,169,113,.15);color:var(--down);}
+
+  .dateChips{display:flex;flex-wrap:wrap;gap:6px;}
+  .dateChip{background:var(--panel-2);border:1px solid var(--border);color:var(--text-dim);font-size:11px;font-weight:600;padding:6px 10px;border-radius:16px;}
+  .dateChip.active{background:rgba(76,141,255,.18);color:var(--text);border-color:var(--accent);}
+
+  /* ---- 多股雷達 ---- */
+  .poolChip{display:inline-flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--border);border-radius:16px;padding:5px 6px 5px 10px;font-size:12px;font-family:var(--mono);}
+  .poolChip button{background:rgba(232,84,58,.18);color:var(--up);border:none;border-radius:50%;width:18px;height:18px;font-size:11px;line-height:1;padding:0;font-weight:700;}
+  #heartbeatLight{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5b7a99;margin-right:6px;animation:breathe 3s ease-in-out infinite;}
+  @keyframes breathe{0%,100%{opacity:.35;box-shadow:0 0 0 0 rgba(91,122,153,.4);}50%{opacity:1;box-shadow:0 0 6px 2px rgba(91,122,153,.5);}}
+  .blink-fast{animation:blinkFast .5s steps(1) infinite;}
+  @keyframes blinkFast{0%,49%{opacity:1;}50%,100%{opacity:.25;}}
+  .pulse-slow{animation:pulseSlow 3s ease-in-out infinite;}
+  @keyframes pulseSlow{0%,100%{opacity:.55;}50%{opacity:1;}}
+  #radarStatusBanner{display:none;border-radius:10px;padding:14px;text-align:center;font-weight:800;font-size:15px;margin-bottom:12px;}
+  #radarStatusBanner.bull{display:block;background:rgba(239,83,80,.14);color:#ef5350;box-shadow:inset 0 0 0 1px rgba(239,83,80,.4);}
+  #radarStatusBanner.bear{display:block;background:rgba(38,166,154,.14);color:#26a69a;box-shadow:inset 0 0 0 1px rgba(38,166,154,.4);}
+  #radarStatusBanner.pending{display:block;background:rgba(33,150,243,.12);color:#2196f3;box-shadow:inset 0 0 0 1px rgba(33,150,243,.35);}
+  .lightDot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle;}
+  .radarRow{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(42,48,64,.6);font-size:12px;font-family:var(--mono);}
+  .radarRow:last-child{border-bottom:none;}
+  .goldRow{background:rgba(255,245,157,.14) !important;}
+  .goldRow td{color:#fff59d !important;}
+  .miniBtn{background:rgba(76,141,255,.16);color:var(--accent);border:none;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="accent-dot"></span>台股 K 線 &amp; 支撐壓力查詢</h1>
+  <p class="sub">日K / 5分K 切換 · 交界—壓力—支撐即時計算 · 資料來源:富果 Fugle 行情 API</p>
+
+  <nav class="navbar">
+    <button id="navKline" class="active">K線查詢</button>
+    <button id="navScreener">多空選股</button>
+    <button id="navRadar">多股雷達</button>
+  </nav>
+
+  <section id="page-kline" class="page">
+  <div class="panel">
+    <div class="row">
+      <input id="symbolInput" type="text" placeholder="股票代號,例如 2330" inputmode="numeric" autocomplete="off">
+      <button id="queryBtn">查詢</button>
+    </div>
+    <div class="row" style="margin-top:8px;align-items:center;">
+      <button class="ghost" id="liveToggleBtn" style="flex:0 0 auto;">▶ 即時更新</button>
+      <select id="liveIntervalSelect" style="flex:0 0 auto;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 8px;font-size:13px;">
+        <option value="5000">每 5 秒</option>
+        <option value="10000" selected>每 10 秒</option>
+        <option value="30000">每 30 秒</option>
+      </select>
+      <span id="liveIndicator" style="font-size:11px;color:var(--text-faint);align-self:center;white-space:nowrap;">⚪ 未啟動</span>
+    </div>
+    <details style="margin-top:8px;">
+      <summary>進階設定(API 金鑰)</summary>
+      <div class="row" style="margin-top:8px;">
+        <input id="apiKeyInput" type="password" placeholder="貼上你的 Fugle API 金鑰(若未寫入原始碼)">
+      </div>
+      <p class="note">沒有金鑰嗎?到 <a href="https://developer.fugle.tw/docs/key/" style="color:var(--accent)">developer.fugle.tw</a> 免費註冊富果會員即可申請「基本用戶」金鑰,不需要開證券戶。申請好以後,建議直接把金鑰貼在這個檔案最上方的 CONFIG.FUGLE_API_KEY 裡,之後開這個網頁就不用再輸入了。</p>
+    </details>
+    <div id="statusBar"></div>
+  </div>
+
+  <div class="panel" id="quotePanel" style="display:none;">
+    <div class="panel-title"><span id="quoteDate">-</span><span id="quoteFlag"></span></div>
+    <div class="quoteHead">
+      <span class="name" id="stockName">-</span>
+      <span class="price" id="lastPrice">-</span>
+      <span class="chg" id="changeVal">-</span>
+    </div>
+    <div class="grid4">
+      <div class="cell"><div class="lbl">昨收</div><div class="val" id="prevCloseVal">-</div></div>
+      <div class="cell"><div class="lbl">開盤</div><div class="val" id="openVal">-</div></div>
+      <div class="cell"><div class="lbl">最高</div><div class="val" id="highVal">-</div></div>
+      <div class="cell"><div class="lbl">最低</div><div class="val" id="lowVal">-</div></div>
+      <div class="cell"><div class="lbl">成交量(張)</div><div class="val" id="volVal">-</div></div>
+      <div class="cell"><div class="lbl">漲停</div><div class="val" id="limitUpVal">-</div></div>
+      <div class="cell"><div class="lbl">跌停</div><div class="val" id="limitDownVal">-</div></div>
+      <div class="cell"><div class="lbl">均價</div><div class="val" id="avgVal">-</div></div>
+    </div>
+  </div>
+
+  <div class="panel" id="srPanel" style="display:none;">
+    <div class="panel-title">
+      <span>當沖 壓力 / 交界 / 支撐</span>
+    </div>
+    <div class="srGrid">
+      <div class="srCell res"><div class="lbl">壓力</div><div class="val" id="resVal">-</div></div>
+      <div class="srCell mid"><div class="lbl">交界(今開)</div><div class="val" id="midVal">-</div></div>
+      <div class="srCell sup"><div class="lbl">支撐</div><div class="val" id="supVal">-</div></div>
+    </div>
+    <div class="methodRow">
+      <button class="tab active" id="methodLimitBtn" style="flex:1">漲跌停 ±10%</button>
+      <button class="tab" id="methodAtrBtn" style="flex:1">ATR 區間</button>
+      <input id="atrMultInput" type="number" value="1" step="0.1" min="0.1" style="display:none;width:64px;flex:0 0 64px;text-align:center;">
+    </div>
+    <p class="note" id="srNote">壓力 = 昨收×1.10(依 tick 無條件捨去);支撐 = 昨收×0.90(依 tick 無條件進位);交界 = 今日開盤價。價格在交界之上偏多、之下偏空;觸及壓力看「遇壓拉回」或「帶量突破」,觸及支撐看「站穩支撐」或「帶量跌破」。僅供參考,不構成投資建議。</p>
+  </div>
+
+  <div class="panel">
+    <div class="tabRow">
+      <button class="tab active" id="tabDaily">日K</button>
+      <button class="tab" id="tabFivemin">5分K</button>
+    </div>
+    <div class="fiveminCtrl" id="fiveminCtrl">
+      <button class="ghost" id="todayBtn" style="flex:0 0 auto;">今天(即時)</button>
+      <input id="fiveminDate" type="date" style="flex:1;">
+      <button id="fiveminGoBtn" style="flex:0 0 auto;">查此日</button>
+    </div>
+    <div class="row" style="margin-bottom:8px;flex-wrap:wrap;">
+      <button class="ghost" id="zoomOutBtn" style="flex:0 0 auto;padding:6px 12px;">－</button>
+      <button class="ghost" id="zoomInBtn" style="flex:0 0 auto;padding:6px 12px;">＋</button>
+      <button class="ghost" id="resetViewBtn" style="flex:0 0 auto;padding:6px 12px;">還原</button>
+      <button class="ghost" id="drawModeBtn" style="flex:0 0 auto;padding:6px 12px;">✎ 畫線</button>
+      <button class="ghost" id="clearDrawBtn" style="flex:0 0 auto;padding:6px 12px;">清畫線</button>
+      <button class="ghost" id="clearQueryBtn" style="flex:0 0 auto;padding:6px 12px;">清查價線</button>
+    </div>
+    <p class="note" style="margin:-4px 0 8px;">拖曳平移、雙指或滾輪縮放。一般模式下輕點一下 = 留一條亮黃色查價線(price along your finger),再點一次同一價位附近 = 移除;開啟「✎畫線」後拖曳畫趨勢線、輕點畫水平線。</p>
+    <canvas id="chart" height="320"></canvas>
+    <div id="chartMeta"><span id="chartRangeLabel">-</span><span id="chartUpdatedLabel">-</span></div>
+  </div>
+
+  <footer>
+    <div class="kv"><span>資料來源</span><span>富果 Fugle 行情 API(即時報價 + 歷史K線)</span></div>
+    <div class="kv"><span>更新方式</span><span>預設手動查詢;可按「即時更新」自動輪詢(每次只更新最新一筆,不重排歷史K棒)</span></div>
+    <div class="kv"><span>用量提醒</span><span>基本用戶額度 60次/分鐘,建議即時更新間隔勿低於 5 秒</span></div>
+    <div class="kv"><span>提醒</span><span>盤中即時資料可能有數秒延遲;本頁僅供個人參考,不構成投資建議</span></div>
+  </footer>
+  </section>
+
+  <section id="page-screener" class="page hidden">
+    <div class="panel">
+      <div class="panel-title"><span>多空選股</span></div>
+      <p class="note">從全上市股票的「成交值排行」抓熱門池(預設抓成交值前
+        <input id="poolSizeInput" type="number" value="150" min="30" max="500" style="width:56px;display:inline-block;padding:4px 6px;">
+        檔),再依漲跌幅排出熱門強勢股與熱門弱勢股,各取
+        <input id="topNInput" type="number" value="15" min="5" max="50" style="width:48px;display:inline-block;padding:4px 6px;">
+        檔。</p>
+      <div class="row" style="margin-top:8px;">
+        <button id="screenerFetchBtn">抓取今日排行</button>
+      </div>
+      <div class="row" style="margin-top:8px;align-items:center;">
+        <button class="ghost" id="screenerAutoBtn" style="flex:0 0 auto;">▶ 自動更新</button>
+        <select id="screenerIntervalSelect" style="flex:0 0 auto;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 8px;font-size:13px;">
+          <option value="60000">每 1 分鐘</option>
+          <option value="120000">每 2 分鐘</option>
+          <option value="300000" selected>每 5 分鐘</option>
+          <option value="600000">每 10 分鐘</option>
+        </select>
+        <span id="screenerAutoIndicator" style="font-size:11px;color:var(--text-faint);align-self:center;white-space:nowrap;">⚪ 未啟動</span>
+      </div>
+      <div id="screenerStatus" style="font-size:12px;min-height:16px;color:var(--text-dim);margin-top:6px;"></div>
+      <p class="note">資料來源:證交所開放資料(STOCK_DAY_ALL,約每日更新一次)+ 三大法人買賣超日報(T86,官方允許自動存取的報表路徑)。證交所另外還有 MI_INDEX20、TWTB4U 這類「盤中即時」排行報表,但那些網址在 robots.txt 明確拒絕自動化存取,所以沒有接——「自動更新」開關重抓的是每日資料,不是真正盤中即時的。「隔日沖籌碼」需要券商分點資料,免費管道抓不到可靠的個股當沖數據,所以沒有另外標註;三大法人買賣超(外資+投信+自營商合計,單位:張)則是真實的官方籌碼資料,已經加進表格最後一欄。</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title"><span style="color:var(--up)">🔥 熱門強勢股</span></div>
+      <table class="rankTable"><thead><tr><th>股票</th><th>收盤</th><th>漲跌幅</th><th>成交值(億)</th><th>三大法人</th><th></th></tr></thead>
+        <tbody id="strongTableBody"><tr><td colspan="6" style="color:var(--text-faint);">尚未抓取</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title"><span style="color:var(--down)">🧊 熱門弱勢股</span></div>
+      <table class="rankTable"><thead><tr><th>股票</th><th>收盤</th><th>漲跌幅</th><th>成交值(億)</th><th>三大法人</th><th></th></tr></thead>
+        <tbody id="weakTableBody"><tr><td colspan="6" style="color:var(--text-faint);">尚未抓取</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="page-radar" class="page hidden">
+    <div class="panel">
+      <div class="panel-title"><span><span id="heartbeatLight"></span>股票池雷達(4型態自動偵測)</span></div>
+      <p class="note">直接沿用現有的壓力/交界/支撐公式(漲跌停法),每個輪詢週期自動比對「突破回踩、假跌破、跌破轉壓、假突破」四種型態。5分K數據來自富果,盤中會依開盤時段自動調整爆量門檻(09:00-09:15 用 2.5倍均量,09:15-13:30 用 1.5倍均量)。</p>
+      <div class="row">
+        <input id="radarSymbolInput" type="text" list="radarNameList" placeholder="輸入代號或中文股名,例如 2330 / 台積電" style="flex:1;">
+        <datalist id="radarNameList"></datalist>
+        <button id="radarAddBtn" style="flex:0 0 auto;">➕ 監控</button>
+      </div>
+      <div class="dateChips" id="radarPoolList" style="margin-top:10px;"><span class="note">尚未加入任何股票(最多10檔)</span></div>
+      <div class="row" style="margin-top:10px;align-items:center;">
+        <button class="ghost" id="radarRunBtn" style="flex:0 0 auto;">▶ 開始監控</button>
+        <select id="radarIntervalSelect" style="flex:0 0 auto;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 8px;font-size:13px;">
+          <option value="30000">每 30 秒</option>
+          <option value="45000" selected>每 45 秒</option>
+          <option value="60000">每 60 秒</option>
+          <option value="120000">每 2 分鐘</option>
+        </select>
+        <button class="ghost" id="radarNotifyBtn" style="flex:0 0 auto;">🔔 允許通知</button>
+      </div>
+      <div id="radarStatus" style="font-size:12px;min-height:16px;color:var(--text-dim);margin-top:6px;"></div>
+      <p class="note">用量估算:每檔股票每輪詢一次要 2 支 API(報價+5分K)。10檔 × 2 ÷ 45秒 ≈ 26.7次/分鐘,免費方案上限 60次/分鐘,留了空間給其他頁面同時使用。輪詢是逐檔排隊送出,不會瞬間打爆額度。開始監控時會嘗試申請「螢幕保持喚醒」,停止監控自動釋放(裝置/瀏覽器不支援的話會自動略過,不影響其他功能)。</p>
+    </div>
+
+    <div id="radarStatusBanner"></div>
+
+    <div class="panel">
+      <div class="panel-title"><span>今日型態觸發統計</span><button class="miniBtn" id="radarExportBtn">⬇ 匯出今日紀錄</button></div>
+      <p class="note">依今日總觸發次數自動排序,次數最多的那檔會亮金色。點代號可直接跳去K線頁看圖。</p>
+      <table class="rankTable"><thead><tr><th>股票</th><th>突破回踩</th><th>假跌破</th><th>跌破轉壓</th><th>假突破</th><th>總計</th></tr></thead>
+        <tbody id="radarStatsBody"><tr><td colspan="6" style="color:var(--text-faint);">尚無資料</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+/* ========= 設定區 ========================================
+   把你申請到的 Fugle API 金鑰貼在下面的引號中,存檔後這個網頁
+   就會自動使用,不用每次打開都重新輸入。
+   申請位置: https://developer.fugle.tw/docs/key/ (免費,註冊富果會員即可)
+   =========================================================== */
+const CONFIG = {
+  FUGLE_API_KEY: "NGY0NGFkYzUtZjg2Yi00MDQzLThjZTMtMDhkNTUyOGZhOGM0IGRmYTRhODcxLWMxNDctNGU5Ni1iNTE2LTQ0OTZlZGI2Y2I4OQ", // <-- 貼在這裡,例如 "abcd1234...."
+  CORS_PROXY: "https://api.allorigins.win/raw?url=" // 免費排行榜資料要靠這個代理才能在瀏覽器直接抓證交所資料,失效時可換別的代理網址
+};
+/* =========================================================== */
+
+const API_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
+
+// ---------- 共用狀態 ----------
+const state = {
+  symbol: null,
+  quote: null,
+  dailyCandles: [],   // 升冪排序 {date,open,high,low,close,volume}
+  fiveminCandles: [], // 升冪排序,目前顯示中的那一天/即時
+  fiveminIsToday: true,
+  timeframe: "D",      // 'D' or '5'
+  method: "limit",      // 'limit' or 'atr'
+  atrMult: 1,
+  views: { D: null, "5": null },     // {start, count} 每個週期各自記自己的縮放/平移位置
+  drawings: { D: [], "5": [] },      // 每個週期各自的手畫線 {type:'h',price} 或 {type:'trend',i1,p1,i2,p2}
+  queryLines: { D: [], "5": [] },    // 一般模式輕點留下的亮黃色查價線 {price}
+  crosshair: null,                   // 目前手指/滑鼠位置 {x,y} 的即時十字查價線
+  markers: {},                       // 雷達型態觸發標記,依股票代號存 [{date, dir:'up'|'down', label}]
+  drawMode: false
+};
+const MIN_VIEW_COUNT = 10;
+const DEFAULT_DAILY_COUNT = 60;
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const symbolInput = $("symbolInput");
+const apiKeyInput = $("apiKeyInput");
+const queryBtn = $("queryBtn");
+const statusBar = $("statusBar");
+const quotePanel = $("quotePanel");
+const srPanel = $("srPanel");
+const tabDaily = $("tabDaily");
+const tabFivemin = $("tabFivemin");
+const fiveminCtrl = $("fiveminCtrl");
+const fiveminDate = $("fiveminDate");
+const todayBtn = $("todayBtn");
+const fiveminGoBtn = $("fiveminGoBtn");
+const methodLimitBtn = $("methodLimitBtn");
+const methodAtrBtn = $("methodAtrBtn");
+const atrMultInput = $("atrMultInput");
+const canvas = $("chart");
+const chartRangeLabel = $("chartRangeLabel");
+const chartUpdatedLabel = $("chartUpdatedLabel");
+
+function getApiKey(){
+  return (CONFIG.FUGLE_API_KEY && CONFIG.FUGLE_API_KEY.trim()) || apiKeyInput.value.trim();
+}
+
+function setStatus(msg, kind){
+  statusBar.textContent = msg || "";
+  statusBar.className = kind ? kind : "";
+}
+
+// ---------- 數字/tick 工具 ----------
+function tickSizeCents(cents){
+  if(cents < 1000) return 1;     // <10   -> 0.01
+  if(cents < 5000) return 5;     // <50   -> 0.05
+  if(cents < 10000) return 10;   // <100  -> 0.1
+  if(cents < 50000) return 50;   // <500  -> 0.5
+  if(cents < 100000) return 100; // <1000 -> 1
+  return 500;                    // >=1000-> 5
+}
+function roundDownTick(price){
+  const cents = Math.round(price * 100);
+  const t = tickSizeCents(cents);
+  return Math.floor(cents / t) * t / 100;
+}
+function roundUpTick(price){
+  const cents = Math.round(price * 100);
+  const t = tickSizeCents(cents);
+  return Math.ceil(cents / t) * t / 100;
+}
+function priceTick(price){
+  return tickSizeCents(Math.round(Math.max(price,0.01) * 100)) / 100;
+}
+function tickDecimals(tick){
+  return tick < 0.1 ? 2 : (tick < 1 ? 1 : 0);
+}
+function fmt(n, d){
+  if(n === null || n === undefined || Number.isNaN(n)) return "-";
+  return Number(n).toLocaleString("zh-TW", {minimumFractionDigits:d ?? 2, maximumFractionDigits:d ?? 2});
+}
+function fmtInt(n){
+  if(n === null || n === undefined || Number.isNaN(n)) return "-";
+  return Math.round(n).toLocaleString("zh-TW");
+}
+function todayStr(){
+  const d = new Date();
+  const tzOffsetMs = 8*60*60*1000; // 台北時間
+  const t = new Date(d.getTime() + (d.getTimezoneOffset()*60000) + tzOffsetMs);
+  return t.toISOString().slice(0,10);
+}
+function addDaysStr(baseStr, days){
+  const d = new Date(baseStr + "T00:00:00+08:00");
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0,10);
+}
+
+// ---------- fetch 包裝 ----------
+async function fugleGet(path, params){
+  const key = getApiKey();
+  if(!key){
+    throw new Error("尚未設定 API 金鑰(請展開「進階設定」輸入,或寫入原始碼 CONFIG 區塊)");
+  }
+  const url = new URL(API_BASE + path);
+  Object.entries(params || {}).forEach(([k,v]) => { if(v !== undefined && v !== null) url.searchParams.set(k, v); });
+  let res;
+  try{
+    res = await fetch(url.toString(), { headers: { "X-API-KEY": key } });
+  }catch(e){
+    throw new Error("連線失敗,請檢查網路連線後再試一次");
+  }
+  if(res.status === 401 || res.status === 403){
+    throw new Error("API 金鑰無效或未授權,請重新確認金鑰");
+  }
+  if(res.status === 404){
+    throw new Error("查無資料(可能是股票代號錯誤、或該區間沒有交易資料)");
+  }
+  if(!res.ok){
+    throw new Error("查詢失敗(HTTP " + res.status + ")");
+  }
+  return res.json();
+}
+
+function normalizeCandles(json){
+  const arr = (json.data || []).map(d => ({
+    date: d.date,
+    open: d.open, high: d.high, low: d.low, close: d.close,
+    volume: d.volume
+  }));
+  arr.sort((a,b) => a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+  return arr;
+}
+
+// ---------- 資料抓取 ----------
+async function fetchQuote(symbol){
+  const json = await fugleGet(`/intraday/quote/${symbol}`, {});
+  return json;
+}
+async function fetchDaily(symbol, fromStr, toStr){
+  const json = await fugleGet(`/historical/candles/${symbol}`, {
+    timeframe: "D", from: fromStr, to: toStr,
+    fields: "open,high,low,close,volume", sort: "asc"
+  });
+  return normalizeCandles(json);
+}
+async function fetchFiveminToday(symbol){
+  const json = await fugleGet(`/intraday/candles/${symbol}`, { timeframe: "5" });
+  return normalizeCandles(json);
+}
+async function fetchFiveminByDate(symbol, dateStr){
+  const json = await fugleGet(`/historical/candles/${symbol}`, {
+    timeframe: "5", from: dateStr, to: dateStr,
+    fields: "open,high,low,close,volume", sort: "asc"
+  });
+  return normalizeCandles(json);
+}
+
+// ---------- 支撐壓力計算 ----------
+function computeATR(dailyAsc, period){
+  if(dailyAsc.length < period + 1) return null;
+  const bars = dailyAsc.slice(-(period+1));
+  let sum = 0;
+  for(let i=1;i<bars.length;i++){
+    const cur = bars[i], prev = bars[i-1];
+    const tr = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
+    sum += tr;
+  }
+  return sum / period;
+}
+
+function computeLevels(){
+  const q = state.quote;
+  if(!q) return null;
+  const prevClose = q.previousClose;
+  const todayOpen = (q.openPrice && q.openPrice > 0) ? q.openPrice : null;
+
+  let res=null, sup=null, mid=todayOpen;
+
+  if(state.method === "limit"){
+    if(prevClose){
+      res = roundDownTick(prevClose * 1.10);
+      sup = roundUpTick(prevClose * 0.90);
+    }
+    if(mid === null) mid = prevClose; // 開盤前先以昨收當參考中線
+  } else {
+    // ATR 區間法: 交界(今開) ± ATR14 * 倍數
+    // ATR 以「已收盤」的日K計算,排除今天這根還在走的K,避免數字整天跳動
+    let dailyForAtr = state.dailyCandles;
+    const t = todayStr();
+    if(dailyForAtr.length && dailyForAtr[dailyForAtr.length-1].date === t){
+      dailyForAtr = dailyForAtr.slice(0, -1);
+    }
+    const atr = computeATR(dailyForAtr, 14);
+    if(todayOpen && atr){
+      // ATR 是連續數字運算,算出來的價位不一定落在台股合法的 tick 上(例如 605.29),
+      // 這裡一律用當時價位對應的 tick 去捨入,壓力捨去、支撐進位,確保顯示的都是真實掛得出去的價位。
+      res = roundDownTick(todayOpen + atr * state.atrMult);
+      sup = roundUpTick(todayOpen - atr * state.atrMult);
+    }
+    if(mid === null) mid = prevClose;
+  }
+  return { res, mid, sup, basis: todayOpen ? "今日開盤價" : "昨日收盤價(尚未開盤)" };
+}
+
+function renderQuoteAndLevels(){
+  const q = state.quote;
+  if(!q) return;
+  quotePanel.style.display = "";
+  srPanel.style.display = "";
+
+  $("quoteDate").textContent = q.date || "-";
+  $("quoteFlag").textContent = q.isClose ? " · 已收盤" : (q.isOpen ? " · 盤中" : " · 尚未開盤");
+  $("stockName").textContent = (q.name || "") + " (" + (q.symbol||state.symbol) + ")";
+
+  const last = q.closePrice || q.lastPrice || q.previousClose;
+  $("lastPrice").textContent = fmt(last);
+  const chg = q.change ?? (last - q.previousClose);
+  const chgPct = q.changePercent ?? (q.previousClose ? (chg/q.previousClose*100) : 0);
+  const chgEl = $("changeVal");
+  chgEl.textContent = (chg>0?"▲":chg<0?"▼":"—") + " " + fmt(Math.abs(chg)) + " (" + fmt(Math.abs(chgPct),2) + "%)";
+  chgEl.style.color = chg>0 ? "var(--up)" : (chg<0 ? "var(--down)" : "var(--flat)");
+  $("lastPrice").style.color = chgEl.style.color;
+
+  $("prevCloseVal").textContent = fmt(q.previousClose);
+  $("openVal").textContent = q.openPrice ? fmt(q.openPrice) : "-";
+  $("highVal").textContent = q.highPrice ? fmt(q.highPrice) : "-";
+  $("lowVal").textContent = q.lowPrice ? fmt(q.lowPrice) : "-";
+  $("volVal").textContent = q.total ? fmtInt(q.total.tradeVolume) : "-";
+  $("avgVal").textContent = q.avgPrice ? fmt(q.avgPrice) : "-";
+
+  if(q.previousClose){
+    $("limitUpVal").textContent = fmt(roundDownTick(q.previousClose*1.10));
+    $("limitDownVal").textContent = fmt(roundUpTick(q.previousClose*0.90));
+  }
+
+  const lv = computeLevels();
+  if(lv){
+    $("resVal").textContent = lv.res!=null ? fmt(lv.res) : "-";
+    $("midVal").textContent = lv.mid!=null ? fmt(lv.mid) : "-";
+    $("supVal").textContent = lv.sup!=null ? fmt(lv.sup) : "-";
+    $("srNote").textContent = state.method === "limit"
+      ? "壓力 = 昨收×1.10(依 tick 無條件捨去);支撐 = 昨收×0.90(依 tick 無條件進位);交界 = " + lv.basis + "。"
+      : "壓力/支撐 = " + lv.basis + " ± 日K ATR(14) × 倍數(目前 " + state.atrMult + ")。ATR 以已收盤的日K計算,不含當天走到一半的K,數字才不會整天亂跳。";
+  }
+
+  redrawChart();
+}
+
+// ---------- 圖表繪製(含縮放/平移/畫線) ----------
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(redrawChart, 120);
+});
+
+function setupHiDPICanvas(cv, cssHeight){
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = cv.parentElement.clientWidth;
+  cv.style.width = cssWidth + "px";
+  cv.style.height = cssHeight + "px";
+  cv.width = Math.round(cssWidth * dpr);
+  cv.height = Math.round(cssHeight * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return { ctx, w: cssWidth, h: cssHeight };
+}
+
+// 網格價格間距一律對齊「該價位真實的 tick」,不會出現 .29 這種不存在的價位
+function niceTickStep(lo, hi, targetTicks){
+  const mid = (lo + hi) / 2;
+  const baseTick = priceTick(mid);
+  const roughStep = (hi - lo) / targetTicks;
+  let mult = Math.max(1, roughStep / baseTick);
+  const mag = Math.pow(10, Math.floor(Math.log10(mult)));
+  const norm = mult / mag;
+  let niceMult;
+  if(norm < 1.5) niceMult = 1;
+  else if(norm < 3) niceMult = 2;
+  else if(norm < 7) niceMult = 5;
+  else niceMult = 10;
+  return baseTick * niceMult * mag;
+}
+
+function defaultView(n, isDaily){
+  const count = Math.min(n, isDaily ? DEFAULT_DAILY_COUNT : n);
+  return { start: Math.max(0, n - count), count: Math.max(MIN_VIEW_COUNT, count) };
+}
+function getView(n){
+  const key = state.timeframe;
+  const isDaily = key === "D";
+  if(!state.views[key]) state.views[key] = defaultView(n, isDaily);
+  const v = state.views[key];
+  v.count = Math.max(MIN_VIEW_COUNT, Math.min(n, Math.round(v.count)));
+  v.start = Math.max(0, Math.min(n - v.count, Math.round(v.start)));
+  return v;
+}
+// 資料更新(新增一根、或換日)時呼叫:如果使用者原本就停在最新那端,更新後繼續貼齊最新;
+// 如果使用者手動平移到別的地方看歷史,就不要幫他跳走。
+function keepViewOnNewData(oldN, newN){
+  const key = state.timeframe;
+  const v = state.views[key];
+  if(!v || oldN === newN) return;
+  const wasAtEdge = (v.start + v.count) >= oldN - 0.5;
+  if(wasAtEdge){
+    v.start += (newN - oldN);
+  }
+}
+function resetView(){
+  const candles = state.timeframe === "D" ? state.dailyCandles : state.fiveminCandles;
+  state.views[state.timeframe] = defaultView(candles.length, state.timeframe === "D");
+  redrawChart();
+}
+function zoomBy(factor, anchorRatio){
+  const candles = state.timeframe === "D" ? state.dailyCandles : state.fiveminCandles;
+  const n = candles.length;
+  if(!n) return;
+  const v = getView(n);
+  const anchorIndex = v.start + v.count * (anchorRatio ?? 0.5);
+  const newCount = Math.max(MIN_VIEW_COUNT, Math.min(n, Math.round(v.count * factor)));
+  v.start = Math.round(anchorIndex - newCount * (anchorRatio ?? 0.5));
+  v.count = newCount;
+  redrawChart();
+}
+function panByIndex(deltaIndex){
+  const candles = state.timeframe === "D" ? state.dailyCandles : state.fiveminCandles;
+  const n = candles.length;
+  if(!n) return;
+  const v = getView(n);
+  v.start = v.start + deltaIndex;
+  redrawChart();
+}
+
+// 這個物件記著最近一次畫圖用的座標換算,滑鼠/手指事件用它把螢幕座標換回「K棒索引+價格」
+let lastLayout = null;
+
+function redrawChart(){
+  const candles = state.timeframe === "D" ? state.dailyCandles : state.fiveminCandles;
+  if(!candles || !candles.length){
+    const { ctx, w, h } = setupHiDPICanvas(canvas, 340);
+    ctx.fillStyle = "#5b6376";
+    ctx.font = "13px " + getComputedStyle(document.body).fontFamily;
+    ctx.textAlign = "center";
+    ctx.fillText("尚無資料,請先查詢股票", w/2, h/2);
+    lastLayout = null;
+    return;
+  }
+  const lv = computeLevels();
+  const isDaily = state.timeframe === "D";
+  const n = candles.length;
+  const view = getView(n);
+  const visible = candles.slice(view.start, view.start + view.count);
+
+  const { ctx, w, h } = setupHiDPICanvas(canvas, 340);
+  ctx.clearRect(0,0,w,h);
+
+  const padL = 50, padR = 54, padT = 12, volH = 56, gapH = 8;
+  const priceH = h - padT - volH - gapH - 20; // 20 留給底部時間軸文字
+
+  let lo = Math.min(...visible.map(c=>c.low));
+  let hi = Math.max(...visible.map(c=>c.high));
+  const curPrice = state.quote ? (state.quote.closePrice || state.quote.lastPrice || state.quote.previousClose) : null;
+  if(lv){ [lv.res, lv.mid, lv.sup].forEach(v => { if(v!=null){ lo=Math.min(lo,v); hi=Math.max(hi,v); } }); }
+  if(curPrice){ lo=Math.min(lo,curPrice); hi=Math.max(hi,curPrice); }
+  const pad = (hi-lo) * 0.10 || 1;
+  lo -= pad; hi += pad;
+
+  const plotW = w - padL - padR;
+  const slot = plotW / view.count;
+  const bodyW = Math.max(1.5, Math.min(11, slot * 0.62));
+
+  const yOf = (price) => padT + priceH * (1 - (price - lo) / (hi - lo));
+  const xOf = (i) => padL + (i - view.start) * slot + slot/2; // i 是相對整個 candles 陣列的絕對索引
+  const priceOf = (y) => lo + (1 - (y - padT) / priceH) * (hi - lo);
+  const indexOf = (x) => view.start + (x - padL) / slot;
+
+  lastLayout = { padL, padR, padT, priceH, volH, gapH, w, h, lo, hi, view, n, slot, yOf, xOf, priceOf, indexOf };
+
+  // 網格 + 價格座標(對齊真實 tick)
+  ctx.strokeStyle = "#2a3040";
+  ctx.fillStyle = "#5b6376";
+  ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+  ctx.textAlign = "left";
+  const step = niceTickStep(lo, hi, 5);
+  const decimals = tickDecimals(priceTick((lo+hi)/2));
+  const startTick = Math.ceil(lo/step)*step;
+  for(let p = startTick; p <= hi; p += step){
+    const y = yOf(p);
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w-padR, y); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillText(fmt(p, decimals), 2, y+3);
+  }
+
+  // K 棒
+  const maxVol = Math.max(...visible.map(c=>c.volume||0), 1);
+  const volTop = padT + priceH + gapH;
+  visible.forEach((c,j) => {
+    const i = view.start + j;
+    const x = xOf(i);
+    const up = c.close >= c.open;
+    const color = up ? "#e8543a" : "#1fa971";
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, yOf(c.high)); ctx.lineTo(x, yOf(c.low)); ctx.stroke();
+    const yO = yOf(c.open), yC = yOf(c.close);
+    const top = Math.min(yO,yC), hgt = Math.max(1, Math.abs(yC-yO));
+    ctx.fillRect(x - bodyW/2, top, bodyW, hgt);
+
+    const vh = (c.volume||0) / maxVol * (volH-4);
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(x - bodyW/2, volTop + (volH-4) - vh, bodyW, vh);
+    ctx.globalAlpha = 1;
+  });
+
+  // 壓力/交界/支撐 水平線
+  if(lv){
+    const lines = [
+      { v: lv.res, color: "#e8543a", label: "壓 " + fmt(lv.res, decimals) },
+      { v: lv.mid, color: "#4c8dff", label: "界 " + fmt(lv.mid, decimals) },
+      { v: lv.sup, color: "#1fa971", label: "撐 " + fmt(lv.sup, decimals) }
+    ];
+    lines.forEach(L => {
+      if(L.v == null) return;
+      const y = yOf(L.v);
+      ctx.strokeStyle = L.color; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w-padR, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = L.color;
+      ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+      ctx.textAlign = "left";
+      ctx.fillText(L.label, w-padR+3, y + 3);
+    });
+  }
+
+  // 使用者手畫的線
+  const drawings = state.drawings[state.timeframe] || [];
+  ctx.lineWidth = 1.3;
+  drawings.forEach(d => {
+    ctx.strokeStyle = "#f5a623";
+    if(d.type === "h"){
+      const y = yOf(d.price);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w-padR, y); ctx.stroke();
+      ctx.fillStyle = "#f5a623"; ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+      ctx.textAlign = "left"; ctx.fillText(fmt(d.price, decimals), w-padR+3, y - 3);
+    } else if(d.type === "trend"){
+      ctx.beginPath(); ctx.moveTo(xOf(d.i1), yOf(d.p1)); ctx.lineTo(xOf(d.i2), yOf(d.p2)); ctx.stroke();
+    }
+  });
+  // 查價線(輕點留下的亮黃色線,跟畫線工具的線分開存放)
+  const queryLines = state.queryLines[state.timeframe] || [];
+  queryLines.forEach(q => {
+    const y = yOf(q.price);
+    ctx.strokeStyle = "#ffe14c"; ctx.setLineDash([5,3]); ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w-padR, y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffe14c"; ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+    ctx.textAlign = "left"; ctx.fillText(fmt(q.price, decimals), w-padR+3, y - 3);
+  });
+
+  // 雷達型態觸發標記(只在正在看的股票=雷達裡的股票時顯示)
+  const markers = (state.symbol && state.markers[state.symbol]) || [];
+  markers.forEach(mk => {
+    const idx = candles.findIndex(c => c.date === mk.date);
+    if(idx < 0 || idx < view.start || idx >= view.start+view.count) return;
+    const x = xOf(idx);
+    const c = candles[idx];
+    ctx.fillStyle = mk.dir === "up" ? "#ef5350" : "#26a69a";
+    ctx.beginPath();
+    if(mk.dir === "up"){
+      const y = yOf(c.low) + 10;
+      ctx.moveTo(x, y-8); ctx.lineTo(x-5, y+2); ctx.lineTo(x+5, y+2); ctx.closePath();
+    } else {
+      const y = yOf(c.high) - 10;
+      ctx.moveTo(x, y+8); ctx.lineTo(x-5, y-2); ctx.lineTo(x+5, y-2); ctx.closePath();
+    }
+    ctx.fill();
+  });
+
+  // 正在拖曳中的預覽線
+  if(state.drawPreview){
+    const dp = state.drawPreview;
+    ctx.strokeStyle = "#f5a623aa"; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(xOf(dp.i1), yOf(dp.p1)); ctx.lineTo(xOf(dp.i2), yOf(dp.p2)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 現價線(實線,右側價格標籤)
+  if(curPrice){
+    const y = yOf(curPrice);
+    const chg = state.quote.change ?? 0;
+    const priceColor = chg>0 ? "#e8543a" : (chg<0 ? "#1fa971" : "#e7e9ee");
+    ctx.strokeStyle = priceColor; ctx.setLineDash([2,2]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w-padR, y); ctx.stroke();
+    ctx.setLineDash([]);
+    const label = fmt(curPrice, decimals);
+    ctx.font = "bold 11px " + getComputedStyle(document.body).fontFamily;
+    const tw = ctx.measureText(label).width + 8;
+    ctx.fillStyle = priceColor;
+    ctx.fillRect(w-padR+1, y-8, tw, 16);
+    ctx.fillStyle = "#0b0e14";
+    ctx.textAlign = "left";
+    ctx.fillText(label, w-padR+5, y+4);
+  }
+
+  // X 軸時間標籤
+  ctx.fillStyle = "#5b6376";
+  ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+  ctx.textAlign = "center";
+  const labelEvery = Math.max(1, Math.ceil(view.count / 6));
+  visible.forEach((c,j) => {
+    if(j % labelEvery !== 0) return;
+    const i = view.start + j;
+    let label;
+    if(isDaily){ label = c.date.slice(5); }
+    else{ const dt = new Date(c.date); label = String(dt.getHours()).padStart(2,"0") + ":" + String(dt.getMinutes()).padStart(2,"0"); }
+    ctx.fillText(label, xOf(i), h-6);
+  });
+
+  chartRangeLabel.textContent = isDaily
+    ? (visible[0].date + " ~ " + visible[visible.length-1].date + "(顯示 " + view.count + "/" + n + " 根日K,可縮放平移)")
+    : ("5分K · " + visible[0].date.slice(0,10) + "(顯示 " + view.count + "/" + n + " 根)");
+  chartUpdatedLabel.textContent = "更新於 " + new Date().toLocaleTimeString("zh-TW", {hour12:false});
+
+  // 即時十字查價線:手指/滑鼠移動時跟著走,放開就消失,單純用來讀價格跟時間
+  if(state.crosshair){
+    const cx = Math.max(padL, Math.min(w-padR, state.crosshair.x));
+    const cy = Math.max(padT, Math.min(padT+priceH, state.crosshair.y));
+    const price = priceOf(cy);
+    const idx = Math.round(indexOf(cx));
+    ctx.strokeStyle = "rgba(231,233,238,.55)"; ctx.setLineDash([2,2]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, cy); ctx.lineTo(w-padR, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+priceH); ctx.stroke();
+    ctx.setLineDash([]);
+    const label = fmt(price, decimals);
+    ctx.font = "bold 11px " + getComputedStyle(document.body).fontFamily;
+    const lw = ctx.measureText(label).width + 8;
+    ctx.fillStyle = "#e7e9ee";
+    ctx.fillRect(w-padR+1, cy-8, lw, 16);
+    ctx.fillStyle = "#12151b";
+    ctx.textAlign = "left";
+    ctx.fillText(label, w-padR+5, cy+4);
+    const c = candles[Math.max(0, Math.min(n-1, idx))];
+    if(c){
+      const tlabel = isDaily ? c.date : (c.date.slice(11,16) || c.date);
+      ctx.font = "10px " + getComputedStyle(document.body).fontFamily;
+      const tw2 = ctx.measureText(tlabel).width + 8;
+      ctx.fillStyle = "#e7e9ee";
+      ctx.fillRect(Math.min(w-padR-tw2, Math.max(padL, cx-tw2/2)), h-18, tw2, 14);
+      ctx.fillStyle = "#12151b";
+      ctx.textAlign = "left";
+      ctx.fillText(tlabel, Math.min(w-padR-tw2, Math.max(padL, cx-tw2/2))+4, h-8);
+    }
+  }
+}
+
+// ---------- 手勢:平移 / 縮放 / 畫線 ----------
+canvas.style.touchAction = "none"; // 交給我們自己處理平移縮放,不要被瀏覽器捲動搶走
+const pointers = new Map(); // pointerId -> {x,y}
+let dragStartView = null;
+let pinchStartDist = null;
+let pinchStartCount = null;
+let dragMoved = false;
+let drawStart = null; // {i, price}
+
+function clientToLocal(e){
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  const p = clientToLocal(e);
+  pointers.set(e.pointerId, p);
+  dragMoved = false;
+
+  if(pointers.size === 1){
+    if(state.drawMode && lastLayout){
+      const i = Math.round(lastLayout.indexOf(p.x));
+      const price = lastLayout.priceOf(p.y);
+      drawStart = { i, price, x0: p.x, y0: p.y };
+    } else if(lastLayout){
+      dragStartView = { start: lastLayout.view.start, x: p.x };
+    }
+  } else if(pointers.size === 2){
+    drawStart = null;
+    const pts = [...pointers.values()];
+    pinchStartDist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y) || 1;
+    pinchStartCount = lastLayout ? lastLayout.view.count : null;
+  }
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if(!pointers.has(e.pointerId)) return;
+  const p = clientToLocal(e);
+  pointers.set(e.pointerId, p);
+  dragMoved = true;
+
+  if(pointers.size === 2 && pinchStartDist && pinchStartCount && lastLayout){
+    const pts = [...pointers.values()];
+    const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y) || 1;
+    const factor = pinchStartDist / dist; // 手指張開(dist變大) -> factor<1 -> 看更少根(放大)
+    const midX = (pts[0].x + pts[1].x) / 2;
+    const anchorRatio = lastLayout.view.count ? (lastLayout.indexOf(midX) - lastLayout.view.start) / lastLayout.view.count : 0.5;
+    const v = state.views[state.timeframe];
+    const newCount = Math.max(MIN_VIEW_COUNT, Math.min(lastLayout.n, Math.round(pinchStartCount * factor)));
+    const anchorIndex = lastLayout.indexOf(midX);
+    v.count = newCount;
+    v.start = Math.round(anchorIndex - newCount * anchorRatio);
+    redrawChart();
+    return;
+  }
+
+  if(drawStart && lastLayout){
+    const i = lastLayout.indexOf(p.x);
+    const price = lastLayout.priceOf(p.y);
+    state.drawPreview = { i1: drawStart.i, p1: drawStart.price, i2: i, p2: price };
+    redrawChart();
+    return;
+  }
+
+  if(dragStartView && lastLayout){
+    const dx = p.x - dragStartView.x;
+    const deltaIndex = -dx / lastLayout.slot;
+    const v = state.views[state.timeframe];
+    v.start = dragStartView.start + deltaIndex;
+  }
+  // 即時查價十字線:只要有一根手指在畫布上移動就跟著更新(平移模式下平移跟查價同時生效)
+  if(pointers.size === 1 && lastLayout){
+    state.crosshair = { x: p.x, y: p.y };
+  }
+  redrawChart();
+});
+
+function endPointer(e){
+  const p = clientToLocal(e);
+  if(drawStart){
+    if(lastLayout){
+      const dxPx = Math.abs(p.x - drawStart.x0), dyPx = Math.abs(p.y - drawStart.y0);
+      const list = state.drawings[state.timeframe];
+      if(dxPx < 6 && dyPx < 6){
+        list.push({ type: "h", price: drawStart.price });
+      } else {
+        const i2 = lastLayout.indexOf(p.x), p2 = lastLayout.priceOf(p.y);
+        list.push({ type: "trend", i1: drawStart.i, p1: drawStart.price, i2, p2 });
+      }
+    }
+    drawStart = null;
+    state.drawPreview = null;
+  } else if(dragStartView && lastLayout && !dragMoved){
+    // 一般模式下的輕點(沒有拖曳位移)= 查價線開關:同價位附近已有線就移除,沒有就新增(智慧吸附到最近K棒的高/低/開/收)
+    const rawPrice = lastLayout.priceOf(p.y);
+    const idx = lastLayout.indexOf(p.x);
+    const candles = state.timeframe === "D" ? state.dailyCandles : state.fiveminCandles;
+    const price = snapToCandle(candles, idx, rawPrice);
+    const tickPx = lastLayout.priceH / (lastLayout.hi - lastLayout.lo);
+    const list = state.queryLines[state.timeframe];
+    const hitIdx = list.findIndex(q => Math.abs(q.price - price) * tickPx < 10);
+    if(hitIdx >= 0) list.splice(hitIdx, 1);
+    else list.push({ price });
+  }
+  state.crosshair = null;
+  redrawChart();
+  pointers.delete(e.pointerId);
+  if(pointers.size < 2){ pinchStartDist = null; pinchStartCount = null; }
+  if(pointers.size === 0) dragStartView = null;
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+
+canvas.addEventListener("wheel", (e) => {
+  if(!lastLayout) return;
+  e.preventDefault();
+  const p = clientToLocal(e);
+  const anchorRatio = (lastLayout.indexOf(p.x) - lastLayout.view.start) / lastLayout.view.count;
+  zoomBy(e.deltaY > 0 ? 1.15 : 0.87, anchorRatio);
+}, { passive: false });
+
+// ---------- 主查詢流程 ----------
+async function runQuery(){
+  const symbol = symbolInput.value.trim();
+  if(!symbol){ setStatus("請輸入股票代號", "err"); return; }
+  if(liveOn) stopLive(); // 換股票時先停掉舊的即時更新,查完可再手動開啟
+  state.symbol = symbol;
+  queryBtn.disabled = true;
+  setStatus("查詢中…");
+  try{
+    const to = todayStr();
+    const from = addDaysStr(to, -200);
+    const [quote, daily] = await Promise.all([
+      fetchQuote(symbol),
+      fetchDaily(symbol, from, to)
+    ]);
+    state.quote = quote;
+    state.dailyCandles = daily;
+
+    // 5分K 預設抓今天即時
+    fiveminDate.value = to;
+    try{
+      state.fiveminCandles = await fetchFiveminToday(symbol);
+      state.fiveminIsToday = true;
+    }catch(e){
+      state.fiveminCandles = [];
+    }
+
+    renderQuoteAndLevels();
+    setStatus("查詢完成 · " + (quote.name||symbol), "ok");
+  }catch(e){
+    setStatus(e.message || "查詢失敗", "err");
+  }finally{
+    queryBtn.disabled = false;
+  }
+}
+
+async function loadFiveminForDate(dateStr){
+  if(!state.symbol){ setStatus("請先查詢一檔股票", "err"); return; }
+  setStatus("讀取 " + dateStr + " 的5分K中…");
+  try{
+    state.fiveminCandles = await fetchFiveminByDate(state.symbol, dateStr);
+    state.fiveminIsToday = false;
+    redrawChart();
+    setStatus("已載入 " + dateStr + " 的5分K", "ok");
+  }catch(e){
+    setStatus(e.message || "讀取失敗", "err");
+  }
+}
+
+async function loadFiveminToday(){
+  if(!state.symbol){ setStatus("請先查詢一檔股票", "err"); return; }
+  fiveminDate.value = todayStr();
+  setStatus("讀取今日即時5分K中…");
+  try{
+    state.fiveminCandles = await fetchFiveminToday(state.symbol);
+    state.fiveminIsToday = true;
+    redrawChart();
+    setStatus("已更新今日5分K", "ok");
+  }catch(e){
+    setStatus(e.message || "讀取失敗", "err");
+  }
+}
+
+// ---------- 即時更新 ----------
+let liveTimer = null;
+let liveOn = false;
+
+function updateLiveIndicator(){
+  $("liveIndicator").textContent = liveOn ? "🟢 即時更新中" : "⚪ 未啟動";
+}
+
+async function liveTick(){
+  if(!state.symbol) return;
+  try{
+    const quote = await fetchQuote(state.symbol);
+    state.quote = quote;
+
+    // 同步把「今天」這一根日K 更新成最新報價,讓日K圖也會跟著即時走,
+    // 但只更新/覆蓋最後一根,不重新排列其他歷史K棒,所以不會整張圖跳動。
+    const t = todayStr();
+    const lastDaily = state.dailyCandles[state.dailyCandles.length - 1];
+    if(quote.openPrice){
+      const synthetic = {
+        date: t,
+        open: quote.openPrice,
+        high: quote.highPrice || quote.openPrice,
+        low: quote.lowPrice || quote.openPrice,
+        close: quote.closePrice || quote.lastPrice || quote.openPrice,
+        volume: quote.total ? quote.total.tradeVolume : 0
+      };
+      if(lastDaily && lastDaily.date === t){
+        state.dailyCandles[state.dailyCandles.length - 1] = synthetic;
+      } else {
+        state.dailyCandles.push(synthetic);
+      }
+    }
+
+    if(state.timeframe === "5" && state.fiveminIsToday){
+      try{ state.fiveminCandles = await fetchFiveminToday(state.symbol); }
+      catch(e){ /* 單次分K更新失敗就跳過,下一輪再試,不中斷即時更新 */ }
+    }
+
+    renderQuoteAndLevels();
+    setStatus("即時更新 · " + new Date().toLocaleTimeString("zh-TW", {hour12:false}), "ok");
+
+    if(quote.isClose){
+      stopLive();
+      setStatus("已收盤,即時更新自動停止", "ok");
+    }
+  }catch(e){
+    setStatus("即時更新失敗:" + (e.message || ""), "err");
+  }
+}
+
+function startLive(){
+  if(!state.symbol){ setStatus("請先查詢一檔股票再開啟即時更新", "err"); return; }
+  liveOn = true;
+  $("liveToggleBtn").textContent = "■ 停止即時";
+  updateLiveIndicator();
+  liveTick();
+  const interval = parseInt($("liveIntervalSelect").value, 10) || 10000;
+  liveTimer = setInterval(liveTick, interval);
+}
+function stopLive(){
+  liveOn = false;
+  clearInterval(liveTimer);
+  liveTimer = null;
+  $("liveToggleBtn").textContent = "▶ 即時更新";
+  updateLiveIndicator();
+}
+
+$("liveToggleBtn").addEventListener("click", () => { liveOn ? stopLive() : startLive(); });
+$("liveIntervalSelect").addEventListener("change", () => {
+  if(liveOn){
+    clearInterval(liveTimer);
+    liveTimer = setInterval(liveTick, parseInt($("liveIntervalSelect").value, 10));
+  }
+});
+
+// ---------- 事件綁定 ----------
+queryBtn.addEventListener("click", runQuery);
+symbolInput.addEventListener("keydown", (e) => { if(e.key === "Enter") runQuery(); });
+
+tabDaily.addEventListener("click", () => {
+  state.timeframe = "D";
+  tabDaily.classList.add("active"); tabFivemin.classList.remove("active");
+  fiveminCtrl.classList.remove("show");
+  redrawChart();
+});
+tabFivemin.addEventListener("click", () => {
+  state.timeframe = "5";
+  tabFivemin.classList.add("active"); tabDaily.classList.remove("active");
+  fiveminCtrl.classList.add("show");
+  redrawChart();
+});
+todayBtn.addEventListener("click", loadFiveminToday);
+fiveminGoBtn.addEventListener("click", () => {
+  const d = fiveminDate.value;
+  if(!d){ setStatus("請先選擇日期", "err"); return; }
+  loadFiveminForDate(d);
+});
+
+methodLimitBtn.addEventListener("click", () => {
+  state.method = "limit";
+  methodLimitBtn.classList.add("active"); methodAtrBtn.classList.remove("active");
+  atrMultInput.style.display = "none";
+  renderQuoteAndLevels();
+});
+methodAtrBtn.addEventListener("click", () => {
+  state.method = "atr";
+  methodAtrBtn.classList.add("active"); methodLimitBtn.classList.remove("active");
+  atrMultInput.style.display = "";
+  renderQuoteAndLevels();
+});
+atrMultInput.addEventListener("change", () => {
+  const v = parseFloat(atrMultInput.value);
+  state.atrMult = Number.isFinite(v) && v > 0 ? v : 1;
+  renderQuoteAndLevels();
+});
+
+fiveminDate.max = todayStr();
+
+// ---------- 圖表工具列:縮放 / 還原 / 畫線開關 / 清除 ----------
+$("zoomOutBtn").addEventListener("click", () => zoomBy(1.4, 0.5));
+$("zoomInBtn").addEventListener("click", () => zoomBy(0.7, 0.5));
+$("resetViewBtn").addEventListener("click", resetView);
+const drawModeBtn = $("drawModeBtn");
+drawModeBtn.addEventListener("click", () => {
+  state.drawMode = !state.drawMode;
+  drawModeBtn.classList.toggle("active", state.drawMode);
+  drawModeBtn.textContent = state.drawMode ? "✎ 畫線中" : "✎ 畫線";
+});
+$("clearDrawBtn").addEventListener("click", () => {
+  state.drawings[state.timeframe] = [];
+  redrawChart();
+});
+$("clearQueryBtn").addEventListener("click", () => {
+  state.queryLines[state.timeframe] = [];
+  redrawChart();
+});
+
+// ==================== 多股雷達:四型態自動偵測 ====================
+const radar = {
+  pool: [],            // 股票代號陣列,最多10檔
+  data: {},            // symbol -> { candles, criticalPrices:[res,mid,sup], quote }
+  stats: {},           // symbol -> { t1,t2,t3,t4 }(今日累計次數)
+  statsDate: null,
+  running: false,
+  timer: null
+};
+const radarSymbolInput = $("radarSymbolInput");
+const radarAddBtn = $("radarAddBtn");
+const radarPoolList = $("radarPoolList");
+const radarRunBtn = $("radarRunBtn");
+const radarIntervalSelect = $("radarIntervalSelect");
+const radarNotifyBtn = $("radarNotifyBtn");
+const radarStatus = $("radarStatus");
+const radarStatsBody = $("radarStatsBody");
+const radarStatusBanner = $("radarStatusBanner");
+const heartbeatLight = $("heartbeatLight");
+
+function todayKey(){ return todayStr(); }
+
+async function loadRadarPersisted(){
+  const poolRaw = await Store.get("radarPool");
+  radar.pool = poolRaw ? JSON.parse(poolRaw) : [];
+  const statsRaw = await Store.get("radarStats");
+  if(statsRaw){
+    const parsed = JSON.parse(statsRaw);
+    if(parsed.date === todayKey()){ radar.stats = parsed.stats; radar.statsDate = parsed.date; }
+    else { radar.stats = {}; radar.statsDate = todayKey(); }
+  } else {
+    radar.stats = {}; radar.statsDate = todayKey();
+  }
+  radar.pool.forEach(s => { if(!radar.stats[s]) radar.stats[s] = { t1:0,t2:0,t3:0,t4:0 }; });
+  renderRadarPoolList();
+  renderRadarStats();
+}
+async function saveRadarPool(){ await Store.set("radarPool", JSON.stringify(radar.pool)); }
+async function saveRadarStats(){ await Store.set("radarStats", JSON.stringify({ date: radar.statsDate, stats: radar.stats })); }
+
+function renderRadarPoolList(){
+  if(!radar.pool.length){
+    radarPoolList.innerHTML = "<span class='note'>尚未加入任何股票(最多10檔)</span>";
+    return;
+  }
+  radarPoolList.innerHTML = radar.pool.map(s =>
+    "<span class='poolChip'>" + s + "<button data-sym='" + s + "'>×</button></span>"
+  ).join("");
+  radarPoolList.querySelectorAll("button").forEach(btn => {
+    btn.addEventListener("click", () => removeRadarSymbol(btn.dataset.sym));
+  });
+}
+async function addRadarSymbol(sym){
+  sym = sym.trim();
+  if(!sym) return;
+  if(radar.pool.includes(sym)){ radarStatus.textContent = sym + " 已經在監控池裡了"; return; }
+  if(radar.pool.length >= 10){ radarStatus.textContent = "最多監控10檔,請先移除一檔再加入"; return; }
+  radar.pool.push(sym);
+  if(!radar.stats[sym]) radar.stats[sym] = { t1:0,t2:0,t3:0,t4:0 };
+  await saveRadarPool();
+  await saveRadarStats();
+  renderRadarPoolList();
+  renderRadarStats();
+  radarStatus.textContent = "已加入 " + sym;
+}
+async function removeRadarSymbol(sym){
+  // 依規格:移除時要同步清記憶體、UI、並「覆蓋」存檔,確保重開網頁不會死而復生
+  radar.pool = radar.pool.filter(s => s !== sym);
+  delete radar.data[sym];
+  await saveRadarPool(); // 直接整份覆蓋存檔,不是增量刪除
+  renderRadarPoolList();
+  radarStatus.textContent = "已移除 " + sym;
+}
+radarAddBtn.addEventListener("click", () => addRadarSymbol(radarSymbolInput.value));
+radarSymbolInput.addEventListener("keydown", (e) => { if(e.key === "Enter") addRadarSymbol(radarSymbolInput.value); });
+
+radarNotifyBtn.addEventListener("click", async () => {
+  if(!("Notification" in window)){ radarStatus.textContent = "這個瀏覽器不支援桌面通知"; return; }
+  const perm = await Notification.requestPermission();
+  radarStatus.textContent = perm === "granted" ? "已允許桌面通知" : "沒有允許通知,型態觸發時只會在頁面上顯示";
+});
+function notify(title, body){
+  try{
+    if("Notification" in window && Notification.permission === "granted"){
+      new Notification(title, { body });
+    }
+  }catch(e){ /* 通知失敗不影響主流程 */ }
+}
+
+// 抓單一股票的報價 + 今日5分K,並用「漲跌停法」算出這檔股票自己的壓力/交界/支撐
+// (雷達為了控制 API 用量,固定用漲跌停法,不像主圖那樣可切換 ATR)
+async function radarFetchOne(sym){
+  const quote = await fetchQuote(sym);
+  const candles = await fetchFiveminWithHistory(sym);
+  let res=null, sup=null, mid=null;
+  if(quote.previousClose){
+    res = roundDownTick(quote.previousClose * 1.10);
+    sup = roundUpTick(quote.previousClose * 0.90);
+  }
+  mid = (quote.openPrice && quote.openPrice > 0) ? quote.openPrice : quote.previousClose;
+  radar.data[sym] = { candles, criticalPrices: [res, mid, sup], quote };
+}
+
+function hadSubstantiveCross(candles, uptoIdxExclusive, price, dir){
+  // 在 kTest 之前最近10根收盤裡,是否已經明顯站上/跌破 price(0.3% 緩衝,避免貼線雜訊誤判)
+  const lookback = candles.slice(Math.max(0, uptoIdxExclusive-10), uptoIdxExclusive);
+  return lookback.some(c => dir === "above" ? c.close > price*1.003 : c.close < price*0.997);
+}
+function computeVolThreshold(dt, avgVolume5, dateStr){
+  const hm = taipeiHM(dateStr) || { h: dt.getHours(), m: dt.getMinutes() };
+  const mins = hm.h*60 + hm.m;
+  if(mins < 9*60 || mins >= 13*60+30) return null; // 非盤中不判斷
+  const isEarly = mins < 9*60+15;
+  return avgVolume5 * (isEarly ? 2.5 : 1.5);
+}
+
+// 核心:四型態比對。回傳 {bullHit,bearHit,bullPending,bearPending}
+function evaluateSymbol(sym){
+  const d = radar.data[sym];
+  if(!d || !d.candles || d.candles.length < 7) return null;
+  const candles = d.candles;
+  const n = candles.length;
+  const kTest = candles[n-2], kNow = candles[n-1];
+  const last5 = candles.slice(n-6, n-1); // 過去5根已收盤(含kTest)
+  const avgVolume5 = last5.reduce((s,c) => s + (c.volume||0), 0) / (last5.length || 1);
+  const dt = new Date(kNow.date);
+  const threshold = computeVolThreshold(dt, avgVolume5, kNow.date);
+  if(threshold === null) return null;
+
+  const bullBase = kTest.volume < avgVolume5*1.2 && kNow.close > kNow.open && kNow.close > kTest.high && kNow.volume > threshold;
+  const bearBase = kTest.volume < avgVolume5*1.2 && kNow.close < kNow.open && kNow.close < kTest.low && kNow.volume > threshold;
+
+  let bullHit=null, bearHit=null, bullPending=null, bearPending=null;
+  const labels = ["壓力","交界","支撐"];
+  (d.criticalPrices || []).forEach((price, pi) => {
+    if(price == null) return;
+    const label = labels[pi];
+    const above = hadSubstantiveCross(candles, n-2, price, "above");
+    const below = hadSubstantiveCross(candles, n-2, price, "below");
+
+    // 型態1:突破回踩支撐做多(先站上,回踩不破)
+    if(above && kTest.low <= price*1.005 && kTest.close >= price){
+      if(bullBase && !bullHit) bullHit = { type:1, label };
+      else if(!bullHit && !bullPending) bullPending = { type:1, label };
+    }
+    // 型態2:假跌破做多(原本在上方,下殺後收回)
+    if(above && kTest.low < price && kTest.close >= price){
+      if(bullBase && !bullHit) bullHit = { type:2, label };
+      else if(!bullHit && !bullPending) bullPending = { type:2, label };
+    }
+    // 型態3:跌破回測轉壓做空(先跌破,反彈不過)
+    if(below && kTest.high >= price*0.995 && kTest.close <= price){
+      if(bearBase && !bearHit) bearHit = { type:3, label };
+      else if(!bearHit && !bearPending) bearPending = { type:3, label };
+    }
+    // 型態4:假突破做空(原本在下方,強攻後拉回)
+    if(below && kTest.high > price && kTest.close <= price){
+      if(bearBase && !bearHit) bearHit = { type:4, label };
+      else if(!bearHit && !bearPending) bearPending = { type:4, label };
+    }
+  });
+  return { bullHit, bearHit, bullPending, bearPending, kNow };
+}
+
+function renderRadarStats(){
+  if(!radar.pool.length){
+    radarStatsBody.innerHTML = "<tr><td colspan='6' style='color:var(--text-faint);'>尚無資料</td></tr>";
+    return;
+  }
+  const rows = radar.pool.map(s => {
+    const st = radar.stats[s] || { t1:0,t2:0,t3:0,t4:0 };
+    const total = (st.t1||0)+(st.t2||0)+(st.t3||0)+(st.t4||0);
+    return { s, st, total };
+  }).sort((a,b) => b.total - a.total); // 依今日總觸發次數自動排序,次數多者置頂
+  const maxTotal = rows[0] ? rows[0].total : 0;
+  radarStatsBody.innerHTML = rows.map(r =>
+    "<tr class=\"" + (maxTotal>0 && r.total===maxTotal ? "goldRow" : "") + "\" onclick=\"jumpToSymbol('" + r.s + "')\">" +
+    "<td>" + r.s + "</td><td>" + r.st.t1 + "</td><td>" + r.st.t2 + "</td><td>" + r.st.t3 + "</td><td>" + r.st.t4 + "</td><td>" + r.total + "</td></tr>"
+  ).join("");
+}
+
+function showRadarBanner(kind, text){
+  if(!kind){ radarStatusBanner.className = ""; radarStatusBanner.textContent = ""; return; }
+  radarStatusBanner.className = kind === "pending" ? "pending pulse-slow" : (kind + " blink-fast");
+  radarStatusBanner.textContent = text || "";
+}
+
+const notifiedBarKey = {}; // symbol -> 上次已經通知過的 kNow.date,同一根5分K只提醒一次
+
+async function radarCycle(){
+  if(!radar.pool.length){ radarStatus.textContent = "股票池是空的,先加幾檔股票再開始監控"; return; }
+  heartbeatLight.style.background = "#4c8dff";
+  let bannerKind = null, bannerText = "";
+  let statsDirty = false;
+  for(const sym of radar.pool){
+    try{
+      await radarFetchOne(sym);
+      const r = evaluateSymbol(sym);
+      if(!r) continue;
+      const barKey = r.kNow.date;
+      const alreadyNotified = notifiedBarKey[sym] === barKey;
+
+      if(r.bullHit){
+        if(!alreadyNotified){
+          radar.stats[sym]["t"+r.bullHit.type] = (radar.stats[sym]["t"+r.bullHit.type]||0) + 1;
+          state.markers[sym] = state.markers[sym] || [];
+          state.markers[sym].push({ date: r.kNow.date, dir:"up", label: r.bullHit.label });
+          if(state.markers[sym].length>20) state.markers[sym].shift();
+          notify(sym + " 多頭反轉確立", "型態" + r.bullHit.type + " · " + r.bullHit.label + " 附近爆量長紅");
+          playBullSound();
+          notifiedBarKey[sym] = barKey;
+          statsDirty = true;
+        }
+        bannerKind = "bull"; bannerText = "🔴 條件觸發:" + sym + " 多頭反轉確立!(型態" + r.bullHit.type + " · " + r.bullHit.label + ")";
+      } else if(r.bearHit){
+        if(!alreadyNotified){
+          radar.stats[sym]["t"+r.bearHit.type] = (radar.stats[sym]["t"+r.bearHit.type]||0) + 1;
+          state.markers[sym] = state.markers[sym] || [];
+          state.markers[sym].push({ date: r.kNow.date, dir:"down", label: r.bearHit.label });
+          if(state.markers[sym].length>20) state.markers[sym].shift();
+          notify(sym + " 空頭反轉確立", "型態" + r.bearHit.type + " · " + r.bearHit.label + " 附近爆量長黑");
+          playBearSound();
+          notifiedBarKey[sym] = barKey;
+          statsDirty = true;
+        }
+        if(bannerKind !== "bull"){ bannerKind = "bear"; bannerText = "🟢 條件觸發:" + sym + " 空頭反轉確立!(型態" + r.bearHit.type + " · " + r.bearHit.label + ")"; }
+      } else if(r.bullPending || r.bearPending){
+        if(!alreadyNotified){ playPrecursorSound(); notifiedBarKey[sym] = barKey; }
+        if(!bannerKind){ bannerKind = "pending"; bannerText = "⚠️ 訊號接近:" + sym + " 正在等待多空突破…"; }
+      }
+
+      if(state.symbol === sym){
+        if(document.hidden) radarNeedsRedraw = true; else redrawChart();
+      }
+    }catch(e){
+      // 單一股票這輪抓失敗就跳過,不影響其他股票跟下一輪
+    }
+  }
+  if(statsDirty) await saveRadarStats();
+  heartbeatLight.style.background = "#5b7a99";
+  renderRadarStats();
+  showRadarBanner(bannerKind, bannerText);
+  radarStatus.textContent = "上次更新 " + new Date().toLocaleTimeString("zh-TW",{hour12:false});
+}
+
+function startRadar(){
+  radar.running = true;
+  radarRunBtn.textContent = "■ 停止監控";
+  acquireWakeLock();
+  radarCycle();
+  const interval = parseInt(radarIntervalSelect.value,10) || 45000;
+  radar.timer = setInterval(radarCycle, interval);
+}
+function stopRadar(){
+  radar.running = false;
+  clearInterval(radar.timer);
+  radar.timer = null;
+  radarRunBtn.textContent = "▶ 開始監控";
+  releaseWakeLock();
+}
+radarRunBtn.addEventListener("click", () => { radar.running ? stopRadar() : startRadar(); });
+radarIntervalSelect.addEventListener("change", () => {
+  if(radar.running){ clearInterval(radar.timer); radar.timer = setInterval(radarCycle, parseInt(radarIntervalSelect.value,10)); }
+});
+
+// Store 定義在稍後的區塊,這裡延遲到下一個 tick 再載入,避免存取到還沒宣告的常數
+setTimeout(loadRadarPersisted, 0);
+
+// ---------- 分頁切換 ----------
+const pages = { kline: $("page-kline"), screener: $("page-screener"), radar: $("page-radar") };
+const navBtns = { kline: $("navKline"), screener: $("navScreener"), radar: $("navRadar") };
+function showPage(name){
+  Object.keys(pages).forEach(k => {
+    pages[k].classList.toggle("hidden", k !== name);
+    navBtns[k].classList.toggle("active", k === name);
+  });
+}
+navBtns.kline.addEventListener("click", () => showPage("kline"));
+navBtns.screener.addEventListener("click", () => showPage("screener"));
+navBtns.radar.addEventListener("click", () => showPage("radar"));
+
+// ---------- 簡易儲存(優先用 Artifact 的 window.storage,退而求其次用 localStorage) ----------
+const Store = {
+  async set(key, value){
+    try{ if(window.storage){ await window.storage.set(key, value, false); return true; } }catch(e){}
+    try{ localStorage.setItem("twk_" + key, value); return true; }catch(e){}
+    return false;
+  },
+  async get(key){
+    try{ if(window.storage){ const r = await window.storage.get(key, false); return r ? r.value : null; } }catch(e){}
+    try{ return localStorage.getItem("twk_" + key); }catch(e){}
+    return null;
+  },
+  async list(prefix){
+    try{
+      if(window.storage){ const r = await window.storage.list(prefix, false); return (r && r.keys) || []; }
+    }catch(e){}
+    try{
+      const keys = [];
+      for(let i=0;i<localStorage.length;i++){ const k = localStorage.key(i); if(k && k.indexOf("twk_"+prefix) === 0) keys.push(k.slice(4)); }
+      return keys;
+    }catch(e){ return []; }
+  },
+  async del(key){
+    try{ if(window.storage){ await window.storage.delete(key, false); return true; } }catch(e){}
+    try{ localStorage.removeItem("twk_" + key); return true; }catch(e){}
+    return false;
+  }
+};
+
+// ---------- 多空選股(免費證交所開放資料) ----------
+const screenerFetchBtn = $("screenerFetchBtn");
+const screenerStatus = $("screenerStatus");
+const poolSizeInput = $("poolSizeInput");
+const topNInput = $("topNInput");
+const strongTableBody = $("strongTableBody");
+const weakTableBody = $("weakTableBody");
+
+function rocDateToIso(d){
+  // "1150914" -> "2026-09-14"
+  if(!d || d.length < 7) return d;
+  const y = parseInt(d.slice(0,3),10) + 1911;
+  return y + "-" + d.slice(3,5) + "-" + d.slice(5,7);
+}
+
+async function fetchStockDayAll(){
+  const target = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL";
+  const url = CONFIG.CORS_PROXY + encodeURIComponent(target);
+  let res;
+  try{
+    res = await fetch(url);
+  }catch(e){
+    throw new Error("連線失敗(CORS 代理可能暫時掛了,可稍後再試或換一個代理)");
+  }
+  if(!res.ok) throw new Error("讀取失敗(HTTP " + res.status + ")");
+  const rows = await res.json();
+  if(!Array.isArray(rows)) throw new Error("回傳格式不對,代理可能出問題了");
+  return rows;
+}
+
+// 三大法人買賣超日報(T86)。走 www.twse.com.tw/rwd/ 這個公開報表路徑,
+// 跟被 robots.txt 擋掉的 /exchangeReport/ 系列不同,允許自動存取。
+// isoDate 格式 "2026-09-14" -> 轉成 T86 要的 "20260914"
+async function fetchT86(isoDate){
+  const ymd = isoDate.replace(/-/g, "");
+  const target = "https://www.twse.com.tw/rwd/zh/fund/T86?date=" + ymd + "&selectType=ALLBUT0999&response=json";
+  const url = CONFIG.CORS_PROXY + encodeURIComponent(target);
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("三大法人資料讀取失敗(HTTP " + res.status + ")");
+  const json = await res.json();
+  if(json.stat !== "OK" || !Array.isArray(json.data)) throw new Error("三大法人資料當天查無資料");
+  const fields = json.fields || [];
+  const codeIdx = fields.indexOf("證券代號");
+  const netIdx = fields.indexOf("三大法人買賣超股數");
+  const map = {};
+  if(codeIdx < 0 || netIdx < 0) return map;
+  json.data.forEach(row => {
+    const code = (row[codeIdx] || "").trim();
+    const net = parseFloat(String(row[netIdx] || "0").replace(/,/g, ""));
+    if(code) map[code] = Number.isNaN(net) ? 0 : net;
+  });
+  return map;
+}
+
+function parseAndRank(rows, poolSize, topN){
+  const parsed = [];
+  for(const r of rows){
+    const code = r.Code;
+    if(!/^[1-9]\d{3}$/.test(code)) continue; // 只留 4 碼一般股票,濾掉 ETF/特別股/權證等
+    const close = parseFloat(r.ClosingPrice);
+    const change = parseFloat(r.Change);
+    const value = parseFloat(r.TradeValue);
+    if(!close || Number.isNaN(close) || Number.isNaN(value) || value <= 0) continue;
+    const prevClose = close - change;
+    const changePct = prevClose ? (change / prevClose * 100) : 0;
+    parsed.push({ code, name: r.Name, close, change, changePct, value, date: rocDateToIso(r.Date), net: null });
+  }
+  parsed.sort((a,b) => b.value - a.value);
+  const pool = parsed.slice(0, poolSize);
+  const byChangeDesc = pool.slice().sort((a,b) => b.changePct - a.changePct);
+  const strong = byChangeDesc.slice(0, topN);
+  const weak = byChangeDesc.slice(-topN).reverse();
+  return { pool, strong, weak, date: pool[0] ? pool[0].date : todayStr() };
+}
+
+let lastScreenerPool = [];
+function populateRadarNameList(pool){
+  const dl = $("radarNameList");
+  dl.innerHTML = pool.slice(0,300).map(s => "<option value=\"" + s.code + "\">" + s.name + " (" + s.code + ")</option>").join("");
+}
+function netChipHtml(net){
+  if(net === null || net === undefined) return "<span class=\"note\">-</span>";
+  const lots = net / 1000; // 股 -> 張
+  const cls = lots > 0 ? "up" : (lots < 0 ? "down" : "");
+  const sign = lots > 0 ? "+" : "";
+  return "<span class=\"chip " + cls + "\">" + sign + fmtInt(lots) + "張</span>";
+}
+function rowHtml(s){
+  const cls = s.change > 0 ? "up" : (s.change < 0 ? "down" : "");
+  const sign = s.change > 0 ? "+" : "";
+  return "<tr>" +
+    "<td onclick=\"jumpToSymbol('" + s.code + "')\"><div class=\"name\">" + s.name + "</div><div class=\"sym\">" + s.code + "</div></td>" +
+    "<td onclick=\"jumpToSymbol('" + s.code + "')\">" + fmt(s.close, 2) + "</td>" +
+    "<td onclick=\"jumpToSymbol('" + s.code + "')\"><span class=\"chip " + cls + "\">" + sign + fmt(s.changePct,2) + "%</span></td>" +
+    "<td onclick=\"jumpToSymbol('" + s.code + "')\">" + fmt(s.value/1e8, 2) + "</td>" +
+    "<td onclick=\"jumpToSymbol('" + s.code + "')\">" + netChipHtml(s.net) + "</td>" +
+    "<td><button class=\"miniBtn\" onclick=\"event.stopPropagation();addRadarSymbol('" + s.code + "')\">➕</button></td>" +
+    "</tr>";
+}
+function renderScreenerTables(result){
+  strongTableBody.innerHTML = result.strong.map(rowHtml).join("") || "<tr><td colspan='6'>無資料</td></tr>";
+  weakTableBody.innerHTML = result.weak.map(rowHtml).join("") || "<tr><td colspan='6'>無資料</td></tr>";
+}
+
+window.jumpToSymbol = function(code){
+  symbolInput.value = code;
+  showPage("kline");
+  runQuery();
+};
+
+async function runScreener(){
+  screenerFetchBtn.disabled = true;
+  screenerStatus.textContent = "抓取全市場成交資料中(約 1000+ 檔,請稍候)…";
+  screenerStatus.style.color = "";
+  try{
+    const rows = await fetchStockDayAll();
+    const poolSize = Math.max(30, Math.min(500, parseInt(poolSizeInput.value,10) || 150));
+    const topN = Math.max(5, Math.min(50, parseInt(topNInput.value,10) || 15));
+    const result = parseAndRank(rows, poolSize, topN);
+
+    let netNote = "";
+    try{
+      screenerStatus.textContent = "抓取三大法人買賣超中…";
+      const netMap = await fetchT86(result.date);
+      [result.pool, result.strong, result.weak].forEach(list => {
+        list.forEach(s => { if(netMap[s.code] !== undefined) s.net = netMap[s.code]; });
+      });
+    }catch(e){
+      netNote = "(三大法人資料這次沒抓到:" + (e.message||"") + ")";
+    }
+
+    renderScreenerTables(result);
+    screenerStatus.textContent = result.date + " 排行完成 · 熱門池 " + result.pool.length + " 檔 " + netNote;
+    screenerStatus.style.color = netNote ? "" : "var(--down)";
+    lastScreenerPool = result.pool; // 給雷達輸入框做中文股名模糊比對用
+    populateRadarNameList(result.pool);
+  }catch(e){
+    screenerStatus.textContent = e.message || "抓取失敗";
+    screenerStatus.style.color = "var(--up)";
+  }finally{
+    screenerFetchBtn.disabled = false;
+  }
+}
+screenerFetchBtn.addEventListener("click", runScreener);
+
+// ---------- 選股頁自動更新(重抓同一份每日資料,不是盤中即時輪詢) ----------
+let screenerAutoTimer = null;
+let screenerAutoOn = false;
+const screenerAutoBtn = $("screenerAutoBtn");
+const screenerIntervalSelect = $("screenerIntervalSelect");
+const screenerAutoIndicator = $("screenerAutoIndicator");
+
+function updateScreenerAutoIndicator(){
+  screenerAutoIndicator.textContent = screenerAutoOn ? "🟢 自動更新中" : "⚪ 未啟動";
+}
+function startScreenerAuto(){
+  screenerAutoOn = true;
+  screenerAutoBtn.textContent = "■ 停止自動更新";
+  updateScreenerAutoIndicator();
+  runScreener();
+  const interval = parseInt(screenerIntervalSelect.value, 10) || 300000;
+  screenerAutoTimer = setInterval(runScreener, interval);
+}
+function stopScreenerAuto(){
+  screenerAutoOn = false;
+  clearInterval(screenerAutoTimer);
+  screenerAutoTimer = null;
+  screenerAutoBtn.textContent = "▶ 自動更新";
+  updateScreenerAutoIndicator();
+}
+screenerAutoBtn.addEventListener("click", () => { screenerAutoOn ? stopScreenerAuto() : startScreenerAuto(); });
+screenerIntervalSelect.addEventListener("change", () => {
+  if(screenerAutoOn){
+    clearInterval(screenerAutoTimer);
+    screenerAutoTimer = setInterval(runScreener, parseInt(screenerIntervalSelect.value, 10));
+  }
+});
+
+// ==================== 補強:純Web Audio音效、Wake Lock、匯出、智慧吸附、5分K歷史拼接 ====================
+
+// ---- Web Audio 純代碼合成音效(不載入任何外部音檔) ----
+let audioCtx = null;
+function getAudioCtx(){
+  if(!audioCtx){
+    try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){ return null; }
+  }
+  if(audioCtx.state === "suspended"){ audioCtx.resume().catch(()=>{}); }
+  return audioCtx;
+}
+function beep(freq, duration, delay, gainVal){
+  const ctx = getAudioCtx();
+  if(!ctx) return;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = freq;
+  gain.gain.value = gainVal ?? 0.15;
+  osc.connect(gain); gain.connect(ctx.destination);
+  const t0 = ctx.currentTime + (delay||0);
+  osc.start(t0);
+  gain.gain.setValueAtTime(gain.gain.value, t0);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0+duration);
+  osc.stop(t0+duration+0.02);
+}
+function playPrecursorSound(){ beep(440, 0.05, 0, 0.12); }
+function playBullSound(){ beep(523.25, 0.10, 0); beep(659.25, 0.15, 0.10); }
+function playBearSound(){ beep(392, 0.12, 0); beep(311.13, 0.20, 0.12); }
+
+// ---- 台北時間解析:直接切K棒時間字串的HH:MM,不依賴裝置本地時區 ----
+function taipeiHM(dateStr){
+  // 支援 "2026-09-16T09:05:00.000+08:00" 或 "2026-09-16 09:05:00" 兩種格式
+  const m = String(dateStr).match(/[T ](\d{2}):(\d{2})/);
+  if(!m) return null;
+  return { h: parseInt(m[1],10), m: parseInt(m[2],10) };
+}
+
+// ---- Wake Lock:監控中盡量不讓螢幕休眠 ----
+let wakeLock = null;
+async function acquireWakeLock(){
+  try{
+    if("wakeLock" in navigator){
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  }catch(e){ /* 裝置/瀏覽器不支援,或不是安全上下文,靜默跳過 */ }
+}
+async function releaseWakeLock(){
+  try{ if(wakeLock){ await wakeLock.release(); wakeLock = null; } }catch(e){}
+}
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "visible" && radar.running && !wakeLock) acquireWakeLock();
+});
+
+// ---- 背景分頁緩衝:分頁不可見時先累積訊號,不做昂貴的canvas重繪,回到前台再一次補繪 ----
+let radarNeedsRedraw = false;
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "visible" && radarNeedsRedraw){
+    radarNeedsRedraw = false;
+    redrawChart();
+  }
+});
+
+// ---- 匯出今日監控紀錄(CSV + JSON 一起包成一個 JSON 檔,附CSV文字方便貼Excel) ----
+$("radarExportBtn").addEventListener("click", () => {
+  const rows = radar.pool.map(s => {
+    const st = radar.stats[s] || {t1:0,t2:0,t3:0,t4:0};
+    return { symbol: s, ...st, markers: state.markers[s] || [] };
+  });
+  const csvLines = ["股票,突破回踩,假跌破,跌破轉壓,假突破"];
+  rows.forEach(r => csvLines.push([r.symbol,r.t1,r.t2,r.t3,r.t4].join(",")));
+  const payload = { date: todayKey(), rows, csv: csvLines.join("\n") };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "radar_" + todayKey() + ".json";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+// ---- 雷達每檔股票:拼接過去5個交易日的5分K + 今天即時,解決開盤前/剛開盤K棒不足的問題 ----
+async function fetchFiveminWithHistory(sym){
+  const today = todayStr();
+  let stitched = [];
+  let tries = 0, daysBack = 1;
+  while(stitched.length < 5 && tries < 8){
+    const d = addDaysStr(today, -daysBack);
+    try{
+      const chunk = await fetchFiveminByDate(sym, d);
+      if(chunk.length) stitched = chunk.concat(stitched);
+    }catch(e){ /* 假日或休市查不到資料,跳過繼續往前找 */ }
+    daysBack++; tries++;
+    if(stitched.length >= 60) break; // 抓夠用就停,省API
+  }
+  let todayChunk = [];
+  try{ todayChunk = await fetchFiveminToday(sym); }catch(e){}
+  const merged = stitched.concat(todayChunk);
+  // 依日期去重(以防拼接到重複的那天)
+  const seen = new Set();
+  return merged.filter(c => { if(seen.has(c.date)) return false; seen.add(c.date); return true; });
+}
+
+// ---- 智慧吸附:查價線鎖定時,吸附到最近K棒的高/低/開/收其中最接近的一個 ----
+function snapToCandle(candles, idx, rawPrice){
+  const c = candles[Math.max(0, Math.min(candles.length-1, Math.round(idx)))];
+  if(!c) return rawPrice;
+  const options = [c.high, c.low, c.open, c.close];
+  let best = rawPrice, bestDist = Infinity;
+  options.forEach(v => { const d = Math.abs(v - rawPrice); if(d < bestDist){ bestDist = d; best = v; } });
+  // 只有夠接近(價差在目前可視範圍的1.5%內)才吸附,避免點在空白處也被硬拉去貼線
+  const range = lastLayout ? (lastLayout.hi - lastLayout.lo) : Infinity;
+  return bestDist < range*0.015 ? best : rawPrice;
+}
+
+// ---- Service Worker 註冊(需要真實HTTPS網域才會真正生效,本機/暫存連結會靜默失敗,不影響其他功能) ----
+if("serviceWorker" in navigator){
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js").catch(() => {
+      // 沒有真實網域(例如本機開檔案或Claude暫存連結)時會失敗,這裡吞掉錯誤,不影響網頁其他功能
+    });
+  });
+}
+</script>
+</body>
+</html>

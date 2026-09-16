@@ -1,0 +1,13 @@
+{
+  "name": "台股四型態反轉監控",
+  "short_name": "台股雷達",
+  "start_url": "./tw_stock_snr_kline.html",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#12151b",
+  "theme_color": "#12151b",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
